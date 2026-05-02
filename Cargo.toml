@@ -39,3 +39,7 @@ required-features = ["async"]
 [[test]]
 name = "integration_serde"
 required-features = ["serde"]
+
+[[example]]
+name = "serde_json"
+required-features = ["serde"]
