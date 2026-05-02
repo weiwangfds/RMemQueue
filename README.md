@@ -317,47 +317,189 @@ rmemqueue = { version = "0.1", features = ["async", "serde"] }
 
 ## Architecture
 
-RMemQueue follows a Kafka-inspired architecture:
+### System Overview
 
-```
-┌─────────────────────────────────────────────────────┐
-│                     Broker (Arc)                     │
-│  ┌─────────────────────────────────────────────────┐  │
-│  │                  Topics                         │  │
-│  │  ┌──────────────────────────────────────────┐  │  │
-│  │  │ Topic: "orders"                          │  │  │
-│  │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐     │  │  │
-│  │  │  │Partition│ │Partition│ │Partition│     │  │  │
-│  │  │  │   0     │ │   1     │ │   2     │ ... │  │  │
-│  │  │  │ [msg0]  │ │ [msg3]  │ │ [msg6]  │     │  │  │
-│  │  │  │ [msg1]  │ │ [msg4]  │ │ [msg7]  │     │  │  │
-│  │  │  │ [msg2]  │ │ [msg5]  │ │ [msg8]  │     │  │  │
-│  │  │  └─────────┘ └─────────┘ └─────────┘     │  │  │
-│  │  └──────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-        ▲                           ▲
-        │                           │
-   BaseProducer                BaseConsumer
-   FutureProducer               StreamConsumer
-   StreamProducer               TypedConsumer
-   TypedProducer
+```mermaid
+graph TB
+    subgraph Broker["Broker (Arc — shared across threads)"]
+        Backend[BrokerBackend]
+        subgraph InMemory["InMemoryBackend"]
+            T1["Topic: orders"]
+            T2["Topic: events"]
+            T3["Topic ..."]
+            T1 --> P00["Partition 0<br/>[msg0, msg1, ...]"]
+            T1 --> P01["Partition 1<br/>[msg3, msg4, ...]"]
+            T1 --> P02["Partition 2<br/>[msg6, msg7, ...]"]
+            T2 --> P10["Partition 0<br/>[msg0, msg1, ...]"]
+        end
+        CG["ConsumerGroup<br/>(members + offsets)"]
+    end
 
-   send(record)                  poll() / stream()
-   metadata()                    subscribe()
-   watermarks()                  commit()
+    subgraph Producers["Producers"]
+        BP["BaseProducer<br/>(sync)"]
+        FP["FutureProducer<br/>(async)"]
+        SP["StreamProducer<br/>(Sink)"]
+        TP["TypedProducer&lt;P, K&gt;<br/>(zero-copy)"]
+    end
+
+    subgraph Consumers["Consumers"]
+        BC["BaseConsumer<br/>(poll)"]
+        SC["StreamConsumer<br/>(recv / Stream)"]
+        TC["TypedConsumer&lt;P, K&gt;<br/>(zero-copy)"]
+    end
+
+    BP -->|send| Backend
+    FP -->|async send| Backend
+    SP -->|Sink&lt;OwnedRecord&gt;| Backend
+    TP -->|produce_typed| Backend
+
+    Backend -->|poll / recv| BC
+    Backend -->|stream| SC
+    Backend -->|typed poll| TC
+
+    BC -->|commit offset| CG
+    SC -->|commit offset| CG
+    TC -->|commit offset| CG
 ```
 
 **Key concepts:**
 
-- **Broker**: Central component holding all topics and partitions, shared via `Arc`
-- **Topic**: Named channel for message streams
-- **Partition**: Ordered sequence of messages within a topic
-- **Message**: Contains payload, optional key, headers, timestamp, partition, offset
-- **Producer**: Writes messages to topics (sync or async)
-- **Consumer**: Reads messages from partitions (polling or streaming)
-- **Consumer Group**: Multiple consumers sharing partition assignment
-- **Offset**: Position marker for consumption progress
+| Concept | Description |
+|---------|-------------|
+| **Broker** | Central component holding topics, partitions, and consumer groups. Shared via `Arc` across all producers and consumers with the same `broker.id`. |
+| **Topic** | Named channel for message streams. Auto-created on first produce. |
+| **Partition** | Ordered, append-only sequence of messages within a topic. Key to parallelism. |
+| **Message** | Contains payload, optional key, headers, timestamp, partition, and offset. |
+| **Producer** | Writes messages to topic partitions (sync, async, typed, or stream). |
+| **Consumer** | Reads messages from partitions via polling, streaming, or typed API. |
+| **Consumer Group** | Named group of consumers that share partition assignment. Enables load balancing. |
+| **Offset** | Monotonic position marker for consumption progress. Can be committed and queried. |
+
+### Message Data Flow
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant Part as Partitioner
+    participant B as Broker
+    participant T as Topic / Partition
+    participant C as Consumer
+
+    P->>Part: 1. select partition<br/>(key hash / round-robin)
+    Part-->>P: partition id
+    P->>B: 2. produce(topic, partition, key, payload, headers)
+    B->>T: 3. append message<br/>assign offset + timestamp
+    T-->>B: (partition, offset, timestamp)
+    B-->>P: RecordMetadata<br/>{topic, partition, offset, timestamp}
+    T-->>C: 4. notify (condvar / tokio::Notify)
+
+    loop Consume Loop
+        C->>B: 5. poll(timeout) / recv().await
+        B->>T: 6. fetch_one(offset)
+        T-->>B: StoredMessage
+        B-->>C: BorrowedMessage / OwnedMessage
+        C->>B: 7. commit_offset(group, topic, partition, offset)
+    end
+```
+
+### Consumer Group Partition Assignment
+
+```mermaid
+graph LR
+    subgraph Group["Consumer Group: order-processors"]
+        C1["Consumer A"]
+        C2["Consumer B"]
+        C3["Consumer C"]
+    end
+
+    subgraph Topic["Topic: orders (6 partitions)"]
+        P0["Partition 0"]
+        P1["Partition 1"]
+        P2["Partition 2"]
+        P3["Partition 3"]
+        P4["Partition 4"]
+        P5["Partition 5"]
+    end
+
+    Assignor["RoundRobinAssignor"]
+
+    P0 --> C1
+    P1 --> C2
+    P2 --> C3
+    P3 --> C1
+    P4 --> C2
+    P5 --> C3
+```
+
+When a consumer joins or leaves the group, the assignor redistributes partitions evenly across all members.
+
+### API Selection Guide
+
+```mermaid
+graph TD
+    Start["Choose your API"] --> Q1{"Async runtime<br/>(tokio)?"}
+    Q1 -->|No| Sync
+    Q1 -->|Yes| Q2{"Need Stream/Sink<br/>integration?"}
+
+    Sync --> Q3{"Typed messages<br/>(zero-copy)?"}
+    Q3 -->|No| BP["BaseProducer<br/>BaseConsumer"]
+    Q3 -->|Yes| TP["TypedProducer&lt;P,K&gt;<br/>TypedConsumer&lt;P,K&gt;"]
+
+    Q2 -->|Stream| SC["StreamProducer<br/>StreamConsumer"]
+    Q2 -->|Simple async| FP["FutureProducer<br/>StreamConsumer"]
+```
+
+### Extensibility Points
+
+```mermaid
+classDiagram
+    class Partitioner {
+        <<trait>>
+        +partition(topic, key, num_partitions) i32
+    }
+    class RoundRobinPartitioner
+    class ConsistentPartitioner
+    class RandomPartitioner
+    Partitioner <|.. RoundRobinPartitioner
+    Partitioner <|.. ConsistentPartitioner
+    Partitioner <|.. RandomPartitioner
+
+    class BrokerBackend {
+        <<trait>>
+        +ensure_topic(topic, num_partitions)
+        +produce(topic, partition, key, payload, headers, ts)
+        +fetch_one(topic, partition, offset)
+        +watermarks(topic, partition)
+        +metadata(broker_id, topic)
+        +shutdown()
+    }
+    class InMemoryBackend
+    BrokerBackend <|.. InMemoryBackend
+
+    class EvictionPolicy {
+        <<trait>>
+        +should_evict(buffer_len, front_msg) bool
+    }
+    class TimeEviction
+    class CapacityEviction
+    EvictionPolicy <|.. TimeEviction
+    EvictionPolicy <|.. CapacityEviction
+
+    class OffsetStore {
+        <<trait>>
+        +commit(group_id, topic, partition, offset)
+        +committed(group_id, topic, partition) Option~i64~
+    }
+    class InMemoryOffsetStore
+    OffsetStore <|.. InMemoryOffsetStore
+
+    class PartitionAssignor {
+        <<trait>>
+        +assign(member_topics, partition_counts)
+    }
+    class RoundRobinAssignor
+    PartitionAssignor <|.. RoundRobinAssignor
+```
 
 ## License
 
